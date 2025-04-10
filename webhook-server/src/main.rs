@@ -5,38 +5,53 @@ use regex::Regex;
 use std::env;
 use std::process::Command;
 use base64::decode;
+use dotenv::dotenv;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct PullRequest {
     number: u32,
     merged: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct Sender {
     login: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
+struct WorkflowRun {
+    conclusion: String,
+}
+
+#[derive(Deserialize, Debug)]
 struct Payload {
     action: String,
-    pull_request: PullRequest,
-    sender: Sender,
+    workflow_run: WorkflowRun,
 }
 
 #[post("/webhook")]
 async fn webhook_handler(payload: web::Json<Payload>) -> impl Responder {
     let payload = payload.into_inner();
 
-    if payload.action == "closed" && payload.pull_request.merged {
+    // println!("Received webhook: {:?}", payload);
+
+    let github_token = env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN not set");
+
+    if payload.action == "completed" && payload.workflow_run.conclusion == "success" {
         println!(
-            "Pull request #{} merged into main by {}",
-            payload.pull_request.number, payload.sender.login
+            "Received webhook",
         );
 
         let github_owner = "ayushka11";
         let github_repo = "test";
         // let github_token = env::var("GITHUB_TOKEN").ok();
+
+        // fetch commit from merge_commit.txt
+        let mut file = std::fs::File::open("merge_commit.txt").unwrap();
+        let mut merge_commit = String::new();
+        std::io::Read::read_to_string(&mut file, &mut merge_commit).unwrap();
+        merge_commit = merge_commit.trim().to_string();
+        // println!("Merge commit from file: {}", merge_commit);
 
         let client = reqwest::Client::new();
         let commits_url = format!(
@@ -46,7 +61,7 @@ async fn webhook_handler(payload: web::Json<Payload>) -> impl Responder {
 
         let commit_response = client
             .get(&commits_url)
-            // .bearer_auth(github_token.clone().unwrap_or_default())
+            .bearer_auth(github_token.clone())
             .header(USER_AGENT, "rust-webhook-server")
             .send()
             .await;
@@ -62,10 +77,15 @@ async fn webhook_handler(payload: web::Json<Payload>) -> impl Responder {
         }
 
         let merge_commit = arr[0]["sha"].as_str().unwrap();
-        let base_commit = arr[1]["sha"].as_str().unwrap();
+        let mut base_commit = arr[1]["sha"].as_str().unwrap();
+        // base_commit = "a23359ccb0f9e96966f80cc17615d53b6aa9ecec";
 
         println!("Merge commit: {}", merge_commit);
         println!("Base commit: {}", base_commit);
+
+        // store the merge commit in a file
+        let mut file = std::fs::File::create("merge_commit.txt").unwrap();
+        std::io::Write::write_all(&mut file, merge_commit.as_bytes()).unwrap();
 
         let diff_url = format!(
             "https://api.github.com/repos/{}/{}/compare/{}...{}",
@@ -150,6 +170,34 @@ async fn test_group_handler(req: web::Json<GroupRequest>) -> impl Responder {
 
     println!("Attempting to add user '{}' to group '{}'", user, group);
 
+    add_user_to_group(user, group);
+
+    HttpResponse::Ok().json("User added to group successfully.")
+}
+
+// test code ends
+
+#[allow(dead_code)]
+fn add_user_to_group(user: &str, group: &str) {
+    let check_user = Command::new("id")
+        .arg(user)
+        .output()
+        .expect("Failed to run id command");
+
+    if !check_user.status.success() {
+        println!("User {} does not exist. Creating user...", user);
+        let create_user = Command::new("sudo")
+            .arg("useradd")
+            .arg(user)
+            .output()
+            .expect("Failed to create user");
+
+        if !create_user.status.success() {
+            eprintln!("Failed to create user: {:?}", String::from_utf8_lossy(&create_user.stderr));
+            return;
+        }
+    }
+
     let output = Command::new("sudo")
         .arg("usermod")
         .arg("-aG")
@@ -157,32 +205,6 @@ async fn test_group_handler(req: web::Json<GroupRequest>) -> impl Responder {
         .arg(user)
         .output()
         .expect("Failed to run usermod");
-
-    let response = GroupResponse {
-        status: if output.status.success() {
-            "Success".to_string()
-        } else {
-            "Failed".to_string()
-        },
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-    };
-
-    HttpResponse::Ok().json(response)
-}
-
-// test code ends
-
-
-#[allow(dead_code)]
-fn add_user_to_group(user: &str, group: &str) {
-    let output = Command::new("sudo")
-        .arg("usermod")
-        .arg("-aG")
-        .arg(group)
-        .arg(user)
-        .output()
-        .expect("Failed to run command");
 
     if output.status.success() {
         println!("User {} added to group {}", user, group);
@@ -193,7 +215,7 @@ fn add_user_to_group(user: &str, group: &str) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    dotenv::dotenv().ok();
+    dotenv().ok();
     let port = env::var("PORT").unwrap_or("2000".to_string());
 
     HttpServer::new(|| {
