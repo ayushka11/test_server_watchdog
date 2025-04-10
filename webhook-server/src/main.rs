@@ -1,4 +1,4 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder, post};
+use actix_web::{web, App, HttpResponse, HttpServer, Responder, post, get};
 use serde::Deserialize;
 use reqwest::header::{ACCEPT, USER_AGENT};
 use regex::Regex;
@@ -6,6 +6,14 @@ use std::env;
 use std::process::Command;
 use base64::decode;
 use dotenv::dotenv;
+
+#[derive(Debug, Deserialize)]
+struct CommitInfo {
+    sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitsResponse(Vec<CommitInfo>);
 
 #[derive(Deserialize, Debug)]
 struct PullRequest {
@@ -29,6 +37,118 @@ struct Payload {
     workflow_run: WorkflowRun,
 }
 
+pub async fn get_commits_after_sha(
+    github_owner: &str,
+    github_repo: &str,
+    target_sha: &str,
+    branch: &str,
+    github_token: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let mut commits_after = Vec::new();
+    let mut page = 1;
+
+    loop {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/commits?sha={}&per_page=100&page={}",
+            github_owner, github_repo, branch, page
+        );
+
+        let response = client
+            .get(&url)
+            .bearer_auth(github_token)
+            .header(USER_AGENT, "rust-webhook-server")
+            .header(ACCEPT, "application/vnd.github.v3+json")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(format!("GitHub API error: {}", response.text().await?).into());
+        }
+
+        let commits: Vec<CommitInfo> = response.json().await?;
+        if commits.is_empty() {
+            break;
+        }
+
+        for commit in &commits {
+            if commit.sha == target_sha {
+                return Ok(commits_after);
+            }
+            commits_after.push(commit.sha.clone());
+        }
+
+        page += 1;
+    }
+
+    Ok(commits_after)
+}
+
+pub async fn process_commit_diff(base_commit: &str, merge_commit: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let github_owner = "ayushka11";
+    let github_repo = "test";
+    let branch = "build";
+
+    let github_token = env::var("GITHUB_TOKEN")?;
+
+    let client = reqwest::Client::new();
+
+    let diff_url = format!(
+        "https://api.github.com/repos/{}/{}/compare/{}...{}",
+        github_owner, github_repo, base_commit, merge_commit
+    );
+
+    let diff_resp = client
+        .get(&diff_url)
+        .header(USER_AGENT, "rust-webhook-server")
+        .header(ACCEPT, "application/vnd.github.v3.diff")
+        .bearer_auth(&github_token)
+        .send()
+        .await?;
+
+    let diff_data = diff_resp.text().await?;
+    println!("Received PR Diff:\n{}", diff_data);
+
+    let re = Regex::new(r"access/([^/]+)/([^/]+)/([\w\d]+)")?;
+    if let Some(caps) = re.captures(&diff_data) {
+        let project = caps.get(1).unwrap().as_str();
+        let cloud_provider = caps.get(2).unwrap().as_str();
+        let hash = caps.get(3).unwrap().as_str();
+
+        println!("Project: {}", project);
+        println!("Cloud Provider: {}", cloud_provider);
+        println!("Hash: {}", hash);
+
+        let file_url = format!(
+            "https://api.github.com/repos/{}/{}/contents/names/{}?ref={}",
+            github_owner, github_repo, hash, branch
+        );
+
+        let file_resp = client
+            .get(&file_url)
+            .header(USER_AGENT, "rust-webhook-server")
+            .header(ACCEPT, "application/vnd.github.v3+json")
+            .bearer_auth(&github_token)
+            .send()
+            .await?;
+
+        let file_json = file_resp.json::<serde_json::Value>().await?;
+
+        if let Some(base64_content) = file_json["content"].as_str() {
+            let clean_base64 = base64_content.replace("\n", "");
+            let decoded = decode(clean_base64)?;
+            let decoded_str = String::from_utf8(decoded)?;
+
+            println!("Decoded File Content: {}", decoded_str);
+
+            // Optional: Run command
+            // add_user_to_group(&decoded_str.trim(), cloud_provider);
+        }
+    }
+
+    Ok(())
+}
+
 #[post("/webhook")]
 async fn webhook_handler(payload: web::Json<Payload>) -> impl Responder {
     let payload = payload.into_inner();
@@ -47,11 +167,11 @@ async fn webhook_handler(payload: web::Json<Payload>) -> impl Responder {
         // let github_token = env::var("GITHUB_TOKEN").ok();
 
         // fetch commit from merge_commit.txt
-        let mut file = std::fs::File::open("merge_commit.txt").unwrap();
-        let mut merge_commit = String::new();
-        std::io::Read::read_to_string(&mut file, &mut merge_commit).unwrap();
-        merge_commit = merge_commit.trim().to_string();
-        // println!("Merge commit from file: {}", merge_commit);
+        let mut file = std::fs::File::open("base_commit.txt").unwrap();
+        let mut base_commit = String::new();
+        std::io::Read::read_to_string(&mut file, &mut base_commit).unwrap();
+        base_commit = base_commit.trim().to_string();
+        println!("Base commit from file: {}", base_commit);
 
         let client = reqwest::Client::new();
         let commits_url = format!(
@@ -78,13 +198,12 @@ async fn webhook_handler(payload: web::Json<Payload>) -> impl Responder {
 
         let merge_commit = arr[0]["sha"].as_str().unwrap();
         let mut base_commit = arr[1]["sha"].as_str().unwrap();
-        // base_commit = "a23359ccb0f9e96966f80cc17615d53b6aa9ecec";
 
         println!("Merge commit: {}", merge_commit);
         println!("Base commit: {}", base_commit);
 
         // store the merge commit in a file
-        let mut file = std::fs::File::create("merge_commit.txt").unwrap();
+        let mut file = std::fs::File::create("base_commit.txt").unwrap();
         std::io::Write::write_all(&mut file, merge_commit.as_bytes()).unwrap();
 
         let diff_url = format!(
@@ -177,6 +296,28 @@ async fn test_group_handler(req: web::Json<GroupRequest>) -> impl Responder {
 
 // test code ends
 
+//test for checking get commits 
+
+#[get("/test-commits")]
+async fn test_commits_handler() -> impl Responder {
+    let github_owner = "ayushka11";
+    let github_repo = "test";
+    let branch = "build"; // or "main"
+    let merge_sha = "a7779b596d9bd2c01085d7ca601ad6ec5187946c"; // hardcoded merge commit SHA
+
+    let github_token = match std::env::var("GITHUB_TOKEN") {
+        Ok(token) => token,
+        Err(_) => return HttpResponse::InternalServerError().body("GITHUB_TOKEN not set"),
+    };
+
+    match get_commits_after_sha(github_owner, github_repo, merge_sha, branch, &github_token).await {
+        Ok(commits) => HttpResponse::Ok().json(commits),
+        Err(e) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
+    }
+}
+
+//test code ends
+
 #[allow(dead_code)]
 fn add_user_to_group(user: &str, group: &str) {
     let check_user = Command::new("id")
@@ -222,6 +363,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .service(webhook_handler)
             .service(test_group_handler) // include both services
+            .service(test_commits_handler) // include both services
     })
     .bind(("127.0.0.1", port.parse::<u16>().unwrap()))?
     .run()
